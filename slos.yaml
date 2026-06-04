@@ -1,0 +1,116 @@
+service: vision-moderation
+slo_window: 30d   # all objectives measured over a rolling 30-day window
+
+# NOTE: The availability SLO (99.7%) is intentionally stricter than the partner SLA (99.5%).
+# This gives an internal error budget buffer: if internal SLO fires, we still have
+# ~0.2 pp of availability headroom before partner refund obligations are triggered.
+
+slos:
+
+  - name: availability
+    description: >
+      Proportion of HTTP requests that return a non-5xx response.
+      Tied to partner SLA: partners receive refunds if availability drops below 99.5%
+      over a rolling hour. Internal objective (99.7%) is stricter than the external SLA
+      to provide an early-warning buffer before contractual obligations are breached.
+    sli:
+      type: request_based
+      good_requests: >
+        HTTP responses with status codes 2xx or 4xx (client errors are not service failures).
+        Excludes health-check and readiness probe traffic.
+        Measured end-to-end at the load balancer.
+      bad_requests: >
+        HTTP responses with status codes 5xx, or requests that time out with no response
+        within 10 seconds.
+      metric: |
+        sum(rate(http_requests_total{status!~"5.."}[5m]))
+        /
+        sum(rate(http_requests_total[5m]))
+    objective: 0.997          # 99.7% — stricter than the 99.5% partner SLA
+    rolling_window: 30d
+    partner_sla: 0.995        # external commitment; internal SLO must stay above this
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        rationale: >
+          At 14.4x burn rate over 1h, the 30-day error budget is exhausted in ~2 days.
+          Page on-call immediately.
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        rationale: >
+          At 6x burn rate over 6h, the 30-day error budget is exhausted in ~5 days.
+          Create a P2 ticket for next business day.
+
+  - name: latency_p95_sync
+    description: >
+      95th-percentile end-to-end latency for the synchronous moderation endpoint.
+      Measured from request receipt at the load balancer to last byte of response sent.
+      Covers 90% of total traffic. Partner SLA states refunds if p95 exceeds 500 ms
+      over a rolling hour; internal target (250 ms) is 2x stricter.
+    sli:
+      type: request_based
+      good_requests: >
+        Requests to /v1/moderate (synchronous) that complete with any 2xx or 4xx status
+        AND have end-to-end latency ≤ 250 ms.
+      bad_requests: >
+        Requests to /v1/moderate that complete with latency > 250 ms, or that return 5xx,
+        or that time out.
+      metric: |
+        sum(rate(http_request_duration_seconds_bucket{
+          route="/v1/moderate", le="0.25"}[5m]))
+        /
+        sum(rate(http_request_duration_seconds_count{
+          route="/v1/moderate"}[5m]))
+    objective: 0.95           # 95% of sync requests must complete within 250 ms
+    rolling_window: 30d
+    partner_sla_threshold_ms: 500   # SLA violation if p95 > 500 ms over rolling 1h
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        rationale: >
+          Rapid latency degradation; budget burns at 14.4x. Likely inference bottleneck
+          or replica saturation. Page immediately.
+      - severity: ticket
+        burn_rate: 3
+        window: 6h
+        rationale: >
+          Slow latency creep; budget burns at 3x over 6h. Investigate Redis p95,
+          GPU utilization, and batch queue spillover. Create P2 ticket.
+
+  - name: latency_p99_sync
+    description: >
+      99th-percentile end-to-end latency for the synchronous moderation endpoint.
+      Catches heavy-tail outliers not visible in the p95 SLO. Threshold set at 500 ms
+      — matching the partner SLA's p95 promise — to ensure that even extreme tail
+      latencies remain within contractually acceptable bounds.
+    sli:
+      type: request_based
+      good_requests: >
+        Requests to /v1/moderate that complete with any non-timeout status AND
+        end-to-end latency ≤ 500 ms.
+      bad_requests: >
+        Requests to /v1/moderate with latency > 500 ms, 5xx responses, or timeouts.
+      metric: |
+        sum(rate(http_request_duration_seconds_bucket{
+          route="/v1/moderate", le="0.5"}[5m]))
+        /
+        sum(rate(http_request_duration_seconds_count{
+          route="/v1/moderate"}[5m]))
+    objective: 0.99           # 99% of sync requests must complete within 500 ms
+    rolling_window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        rationale: >
+          p99 tail exploding at 14.4x burn. Likely a runaway request, retry storm,
+          or single-replica degradation. Page immediately.
+      - severity: ticket
+        burn_rate: 3
+        window: 6h
+        rationale: >
+          Gradual p99 degradation. Investigate GC pauses, model cold paths, and
+          Redis connection pool exhaustion. Create P2 ticket.
